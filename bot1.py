@@ -7,6 +7,11 @@ bot1.py — Telegram-бот-хостинг Python файлов
 import os
 import sys
 import time
+import pysqlite3
+
+# маршрутизируем sqlite3 на pysqlite3
+sys.modules['sqlite3'] = pysqlite3
+
 import sqlite3
 import zipfile
 import threading
@@ -25,11 +30,11 @@ from telebot.apihelper import ApiTelegramException
 TOKEN = "8277699763:AAGee0xepUOj0qiRF28XnFxXHVi06RMDpCk"
 OWNER_ID = 7328238543
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-FILES_DIR = os.path.join(DATA_DIR, "files")
-QUARANTINE_DIR = os.path.join(DATA_DIR, "quarantine")
-DB_PATH = os.path.join(DATA_DIR, "db.sqlite3")
+BASE_DIR = "/tmp"
+DATA_DIR = "/tmp/data"
+FILES_DIR = "/tmp/files"
+QUARANTINE_DIR = "/tmp/quarantine"
+DB_PATH = "/tmp/db.sqlite3"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(FILES_DIR, exist_ok=True)
@@ -1821,4 +1826,5 @@ monitor_thread.start()
 if __name__ == "__main__":
     init_db()
     print("Bot started.")
+
     bot.infinity_polling(skip_pending=True)
