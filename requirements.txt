@@ -1,0 +1,5 @@
+flask
+pyTelegramBotAPI
+psutil
+pysqlite3-binary
+requests
