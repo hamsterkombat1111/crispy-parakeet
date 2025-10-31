@@ -14,6 +14,7 @@ sys.modules['sqlite3'] = pysqlite3
 
 import sqlite3
 import zipfile
+import stat
 import threading
 import ast
 import urllib.parse
@@ -22,7 +23,7 @@ import subprocess
 import random
 import string
 import psutil
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 from telebot import TeleBot, types
 from telebot.apihelper import ApiTelegramException
 
@@ -474,6 +475,22 @@ def user_dir(uid: int) -> str:
     os.makedirs(path, exist_ok=True)
     return path
 
+def resolve_user_path(uid: int, relative_path: str) -> Tuple[str, str, str]:
+    """Возвращает базовый путь пользователя, относительный и абсолютный пути для файла/папки."""
+    base = os.path.abspath(user_dir(uid))
+    rel_norm = os.path.normpath(relative_path or ".")
+    if rel_norm in ("", "."):
+        rel_norm = ""
+
+    if rel_norm and any(part == ".." for part in rel_norm.split(os.sep)):
+        raise ValueError("Недопустимый путь")
+
+    abs_path = os.path.abspath(os.path.join(base, rel_norm))
+    if not abs_path.startswith(base + os.sep) and abs_path != base:
+        raise ValueError("Недопустимый путь")
+
+    return base, rel_norm, abs_path
+
 def quarantine_path(filename: str) -> str:
     ts = int(time.time())
     safe = f"{ts}_{urllib.parse.quote_plus(filename)}"
@@ -504,34 +521,40 @@ def get_quarantine_file(qid: int):
     with db_connect() as conn:
         return conn.execute("SELECT * FROM quarantine WHERE qid=?", (qid,)).fetchone()
 
-def approve_quarantine_file(qid: int):
-    """Разрешает файл из карантина и добавляет его пользователю"""
+def approve_quarantine_file(qid: int) -> Optional[sqlite3.Row]:
+    """Разрешает файл из карантина и добавляет его пользователю."""
     q_file = get_quarantine_file(qid)
     if not q_file:
-        return False
-    
+        return None
+
     uid = q_file["user_id"]
     filename = q_file["filename"]
     imports = q_file["imports"].split(",") if q_file["imports"] else []
     saved_path = q_file["saved_path"]
-    
-    # Перемещаем файл из карантина в папку пользователя
-    user_path = os.path.join(user_dir(uid), filename)
+
     try:
-        os.rename(saved_path, user_path)
-        
-        # Добавляем запись в базу
-        add_file_record(uid, filename, imports)
-        
-        # Обновляем статус в карантине
+        _, rel_path, user_path = resolve_user_path(uid, filename)
+    except ValueError as e:
+        print(f"Ошибка при проверке пути при одобрении файла: {e}")
+        return None
+
+    try:
+        parent_dir = os.path.dirname(user_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
+        os.replace(saved_path, user_path)
+
+        add_file_record(uid, rel_path or filename, imports)
+
         with db_connect() as conn:
             conn.execute("UPDATE quarantine SET status='approved' WHERE qid=?", (qid,))
             conn.commit()
-        
-        return True
+
+        return q_file
     except Exception as e:
         print(f"Ошибка при одобрении файла из карантина: {e}")
-        return False
+        return None
 
 # ---------------- FREEZE ----------------
 def plan_limit(uid: int) -> int:
@@ -607,6 +630,34 @@ def extract_python_imports(code: str) -> List[str]:
             if node.module:
                 imports.add(node.module.split('.')[0])
     return list(imports)
+
+
+def safe_extract_zip(zip_ref: zipfile.ZipFile, target_dir: str) -> List[str]:
+    """Safely extracts a ZIP archive preventing path traversal and returns extracted files."""
+    abs_target_dir = os.path.abspath(target_dir)
+    extracted_files: List[str] = []
+
+    for member in zip_ref.infolist():
+        member_path = os.path.abspath(os.path.join(abs_target_dir, member.filename))
+
+        if not member_path.startswith(abs_target_dir + os.sep) and member_path != abs_target_dir:
+            raise ValueError(f"Недопустимый путь в архиве: {member.filename}")
+
+        # Блокируем символические ссылки внутри архива.
+        # external_attr хранит тип файла в старших битах.
+        if stat.S_ISLNK(member.external_attr >> 16):
+            raise ValueError(f"Недопустимая символическая ссылка в архиве: {member.filename}")
+
+    for member in zip_ref.infolist():
+        extracted_path = zip_ref.extract(member, abs_target_dir)
+        if getattr(member, "is_dir", lambda: member.filename.endswith("/"))():
+            continue
+
+        normalized = os.path.relpath(os.path.abspath(extracted_path), abs_target_dir)
+        extracted_files.append(normalized)
+
+    return extracted_files
+
 
 def extract_js_requires(code: str) -> List[str]:
     """
@@ -766,79 +817,102 @@ def handle_upload(msg):
         f.write(downloaded)
 
     # если архив — распаковываем и проверяем
-    imported_all = []
+    imported_modules: Set[str] = set()
     package_json_found = False
     package_json_dangerous = False
     package_json_warnings = []
-    
+
     if name.endswith(".zip"):
-        with zipfile.ZipFile(save_path, "r") as zip_ref:
-            zip_ref.extractall(save_dir)
+        extracted_paths: List[str] = []
+        try:
+            with zipfile.ZipFile(save_path, "r") as zip_ref:
+                extracted_paths = safe_extract_zip(zip_ref, save_dir)
+        except (zipfile.BadZipFile, ValueError) as exc:
+            os.remove(save_path)
+            return bot.reply_to(msg, f"⚠️ Архив повреждён или содержит недопустимые пути: {exc}")
+
         os.remove(save_path)
-        
-        # Проверяем наличие package.json
-        package_json_path = os.path.join(save_dir, "package.json")
-        if os.path.exists(package_json_path):
-            package_json_found = True
-            with open(package_json_path, "r", encoding="utf-8", errors="ignore") as f:
-                package_content = f.read()
-            
-            dangerous, warnings = scan_package_json(package_content)
-            if dangerous:
-                package_json_dangerous = True
-                package_json_warnings = warnings
-        
-        # Обрабатываем файлы
-        for inner in os.listdir(save_dir):
-            if inner.endswith((".py", ".js")):
-                p = os.path.join(save_dir, inner)
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+
+        abs_save_dir = os.path.abspath(save_dir)
+
+        for raw_path in extracted_paths:
+            normalized_rel = os.path.normpath(raw_path)
+            if normalized_rel in ("", "."):
+                continue
+
+            if normalized_rel.startswith("__MACOSX"):
+                continue
+
+            abs_inner_path = os.path.abspath(os.path.join(abs_save_dir, normalized_rel))
+            if not abs_inner_path.startswith(abs_save_dir + os.sep) and abs_inner_path != abs_save_dir:
+                continue
+
+            if (os.path.basename(normalized_rel) == "package.json" and
+                    os.path.dirname(normalized_rel) == ""):
+                package_json_found = True
+                with open(abs_inner_path, "r", encoding="utf-8", errors="ignore") as f:
+                    package_content = f.read()
+
+                dangerous, warnings = scan_package_json(package_content)
+                if dangerous:
+                    package_json_dangerous = True
+                    package_json_warnings = warnings
+                continue
+
+            if not normalized_rel.endswith((".py", ".js")):
+                continue
+
+            try:
+                with open(abs_inner_path, "r", encoding="utf-8", errors="ignore") as f:
                     code = f.read()
-                
-                file_ext = '.py' if inner.endswith('.py') else '.js'
-                if file_ext == '.py':
-                    imports = extract_python_imports(code)
-                else:
-                    imports = extract_js_requires(code)
-                
-                bad, bads = scan_for_forbidden(code, file_ext)
-                imported_all.extend(imports)
-                
-                # Если package.json опасный или файл опасный - в карантин
-                if (bad or package_json_dangerous) and not u["protection_disabled"]:
-                    qpath = quarantine_path(inner)
-                    os.rename(p, qpath)
-                    
-                    # Добавляем предупреждения из package.json если есть
-                    all_warnings = bads + package_json_warnings
-                    qid = add_quarantine(uid, inner, imports, qpath)
-                    
-                    warning_msg = f"🚫 Найдена запрещённая библиотека в {inner}: {', '.join(all_warnings)}"
-                    if package_json_dangerous:
-                        warning_msg += f"\n⚠️ Обнаружен опасный package.json"
-                    
-                    bot.send_message(uid, warning_msg)
-                    bot.send_message(OWNER_ID,
-                        f"⚠️ Пользователь <a href='tg://user?id={uid}'>{uid}</a> "
-                        f"попытался загрузить опасный код.\n"
-                        f"<b>Файл:</b> {inner}\n"
-                        f"<b>Тип:</b> {file_ext}\n"
-                        f"<b>Package.json:</b> {'ОПАСНЫЙ' if package_json_dangerous else 'безопасный'}\n"
-                        f"<b>Обнаружено:</b> {', '.join(all_warnings)}",
-                        parse_mode='HTML',
-                        reply_markup=types.InlineKeyboardMarkup(row_width=3).add(
-                            types.InlineKeyboardButton("🚫 Забанить", callback_data=f"adm_ban:{uid}"),
-                            types.InlineKeyboardButton("🚷 Игнорировать", callback_data=f"adm_ignore:{qid}"),
-                            types.InlineKeyboardButton("✅ Разрешить", callback_data=f"adm_approve:{qid}")
-                        )
+            except OSError as exc:
+                bot.send_message(uid, f"⚠️ Не удалось прочитать {normalized_rel}: {exc}")
+                continue
+
+            file_ext = '.py' if normalized_rel.endswith('.py') else '.js'
+            if file_ext == '.py':
+                imports = extract_python_imports(code)
+            else:
+                imports = extract_js_requires(code)
+
+            bad, bads = scan_for_forbidden(code, file_ext)
+            imported_modules.update(imports)
+
+            if (bad or package_json_dangerous) and not u["protection_disabled"]:
+                qpath = quarantine_path(normalized_rel)
+                os.rename(abs_inner_path, qpath)
+
+                all_warnings = bads + package_json_warnings
+                unique_warnings = sorted(set(all_warnings)) if all_warnings else []
+                warnings_text = ', '.join(unique_warnings) if unique_warnings else 'нет'
+                qid = add_quarantine(uid, normalized_rel, imports, qpath)
+
+                warning_msg = f"🚫 Найдена запрещённая библиотека в {normalized_rel}: {warnings_text}"
+                if package_json_dangerous:
+                    warning_msg += f"\n⚠️ Обнаружен опасный package.json"
+
+                bot.send_message(uid, warning_msg)
+                bot.send_message(OWNER_ID,
+                    f"⚠️ Пользователь <a href='tg://user?id={uid}'>{uid}</a> "
+                    f"попытался загрузить опасный код.\n"
+                    f"<b>Файл:</b> {normalized_rel}\n"
+                    f"<b>Тип:</b> {file_ext}\n"
+                    f"<b>Package.json:</b> {'ОПАСНЫЙ' if package_json_dangerous else 'безопасный'}\n"
+                    f"<b>Обнаружено:</b> {warnings_text}",
+                    parse_mode='HTML',
+                    reply_markup=types.InlineKeyboardMarkup(row_width=3).add(
+                        types.InlineKeyboardButton("🚫 Забанить", callback_data=f"adm_ban:{uid}"),
+                        types.InlineKeyboardButton("🚷 Игнорировать", callback_data=f"adm_ignore:{qid}"),
+                        types.InlineKeyboardButton("✅ Разрешить", callback_data=f"adm_approve:{qid}")
                     )
-                    continue
-                
-                add_file_record(uid, inner, imports)
+                )
+                continue
+
+            add_file_record(uid, normalized_rel, imports)
     else:
         with open(save_path, "r", encoding="utf-8", errors="ignore") as f:
             code = f.read()
-        
+
         file_ext = '.py' if name.endswith('.py') else '.js'
         if file_ext == '.py':
             imports = extract_python_imports(code)
@@ -866,7 +940,7 @@ def handle_upload(msg):
             )
             return
         add_file_record(uid, name, imports)
-        imported_all = imports
+        imported_modules = set(imports)
 
     # итог
     total = count_user_files(uid)
@@ -875,7 +949,9 @@ def handle_upload(msg):
         check_and_update_freeze(uid)
         return
 
-    success_msg = f"✅ Загружено: <b>{name}</b>\n📦 Импорты: <code>{', '.join(imported_all)}</code>"
+    imports_sorted = sorted(imported_modules)
+    imports_text = ', '.join(imports_sorted) if imports_sorted else 'нет'
+    success_msg = f"✅ Загружено: <b>{name}</b>\n📦 Импорты: <code>{imports_text}</code>"
     if package_json_found:
         if package_json_dangerous:
             success_msg += f"\n⚠️ <b>Внимание:</b> package.json содержит опасные зависимости!"
@@ -981,7 +1057,7 @@ def file_actions_kb(uid: int, fname: str):
     kb = types.InlineKeyboardMarkup(row_width=3)
     key = (uid, fname)
     running = key in RUNNING and RUNNING[key]["proc"].poll() is None
-    
+
     # Первая строка: Запуск/Остановка + Обновить
     if running:
         kb.add(
@@ -1037,6 +1113,73 @@ def files_kb(uid: int):
     kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back"))
     return kb
 
+EXPLORER_PAGE_LIMIT = 20
+
+def explorer_view(uid: int, relative_path: str) -> Tuple[str, types.InlineKeyboardMarkup]:
+    try:
+        _, rel_path, abs_path = resolve_user_path(uid, relative_path)
+    except ValueError:
+        _, rel_path, abs_path = resolve_user_path(uid, "")
+
+    if not os.path.isdir(abs_path):
+        parent = os.path.dirname(rel_path)
+        _, rel_path, abs_path = resolve_user_path(uid, parent)
+
+    try:
+        entries = sorted(os.listdir(abs_path))
+        error_text = None
+    except OSError as exc:
+        entries = []
+        error_text = str(exc)
+
+    directories = []
+    files = []
+    for entry in entries:
+        full_path = os.path.join(abs_path, entry)
+        if os.path.isdir(full_path):
+            directories.append(entry)
+        elif os.path.isfile(full_path):
+            files.append(entry)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    shown = 0
+    total_entries = len(directories) + len(files)
+
+    for entry in directories:
+        if shown >= EXPLORER_PAGE_LIMIT:
+            break
+        shown += 1
+        rel = os.path.join(rel_path, entry) if rel_path else entry
+        encoded = urllib.parse.quote_plus(rel)
+        kb.add(types.InlineKeyboardButton(f"📁 {entry}", callback_data=f"explorer:{encoded}"))
+
+    for entry in files:
+        if shown >= EXPLORER_PAGE_LIMIT:
+            break
+        shown += 1
+        rel = os.path.join(rel_path, entry) if rel_path else entry
+        encoded = urllib.parse.quote_plus(rel)
+        kb.add(types.InlineKeyboardButton(f"📄 {entry}", callback_data=f"explorer_file:{encoded}"))
+
+    if rel_path:
+        parent = os.path.dirname(rel_path)
+        encoded_parent = urllib.parse.quote_plus(parent)
+        kb.add(types.InlineKeyboardButton("⬆️ На уровень выше", callback_data=f"explorer:{encoded_parent}"))
+
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back"))
+
+    display_path = f"/{rel_path}" if rel_path else "/"
+    lines = ["🗂 <b>Проводник</b>", f"Путь: <code>{display_path}</code>"]
+
+    if error_text:
+        lines.append(f"❌ Ошибка чтения каталога: {error_text}")
+    elif total_entries == 0:
+        lines.append("📭 Папка пуста")
+    elif total_entries > shown:
+        lines.append(f"ℹ️ Показаны первые {shown} из {total_entries} элементов")
+
+    return "\n".join(lines), kb
+
 # ---------------- CALLBACKS ----------------
 @bot.callback_query_handler(func=lambda c: c.data.startswith("file:"))
 def open_file_menu(c):
@@ -1044,6 +1187,51 @@ def open_file_menu(c):
     fname = urllib.parse.unquote_plus(c.data.split(":", 1)[1])
     text, kb = file_menu_text_kb(uid, fname)
     bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("explorer:"))
+def open_explorer(c):
+    uid = c.from_user.id
+    u = get_user(uid)
+    if u["plan"] == "free":
+        return bot.answer_callback_query(c.id, "🗂 Проводник доступен только на платных тарифах.", show_alert=True)
+
+    raw_path = c.data.split(":", 1)[1] if ":" in c.data else ""
+    rel_path = urllib.parse.unquote_plus(raw_path)
+    text, kb = explorer_view(uid, rel_path)
+    safe_edit_text(bot.edit_message_text, text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+    bot.answer_callback_query(c.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("explorer_file:"))
+def explorer_file_action(c):
+    uid = c.from_user.id
+    u = get_user(uid)
+    if u["plan"] == "free":
+        return bot.answer_callback_query(c.id, "🗂 Проводник доступен только на платных тарифах.", show_alert=True)
+
+    raw_path = c.data.split(":", 1)[1] if ":" in c.data else ""
+    rel_path = urllib.parse.unquote_plus(raw_path)
+
+    try:
+        _, rel_norm, abs_path = resolve_user_path(uid, rel_path)
+    except ValueError:
+        return bot.answer_callback_query(c.id, "❌ Недопустимый путь", show_alert=True)
+
+    if not os.path.exists(abs_path):
+        return bot.answer_callback_query(c.id, "❌ Файл не найден", show_alert=True)
+
+    if os.path.isdir(abs_path):
+        text, kb = explorer_view(uid, rel_norm)
+        safe_edit_text(bot.edit_message_text, text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+        return bot.answer_callback_query(c.id)
+
+    try:
+        with open(abs_path, "rb") as f:
+            caption = f"🗂 Файл: <code>/{rel_norm}</code>" if rel_norm else "🗂 Файл"
+            bot.send_document(uid, f, caption=caption, parse_mode="HTML")
+    except OSError as exc:
+        return bot.answer_callback_query(c.id, f"❌ Ошибка чтения: {exc}", show_alert=True)
+
+    bot.answer_callback_query(c.id, "📤 Файл отправлен")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(("run:", "stop:", "refresh:", "log:", "del:", "install:")) )
 def h_file_actions(c):
@@ -1484,29 +1672,36 @@ def adm_ignore_callback(c):
     if c.from_user.id != OWNER_ID:
         return
     qid = int(c.data.split(":")[1])
+    q_file = get_quarantine_file(qid)
     with db_connect() as conn:
         conn.execute("UPDATE quarantine SET status='ignored' WHERE qid=?", (qid,))
         conn.commit()
     bot.answer_callback_query(c.id, "Файл проигнорирован")
     bot.edit_message_reply_markup(c.message.chat.id, c.message.id, reply_markup=None)
+    if q_file:
+        uid = q_file["user_id"]
+        filename = q_file["filename"]
+        bot.send_message(uid,
+                         f"🚫 Ваш файл <b>{filename}</b> не прошёл проверку администратора и был отклонён.",
+                         parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("adm_approve:"))
 def adm_approve_callback(c):
     if c.from_user.id != OWNER_ID:
         return
     qid = int(c.data.split(":")[1])
-    
-    if approve_quarantine_file(qid):
-        q_file = get_quarantine_file(qid)
-        if q_file:
-            uid = q_file["user_id"]
-            filename = q_file["filename"]
-            
-            bot.answer_callback_query(c.id, f"Файл {filename} разрешен")
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.id, reply_markup=None)
-            
-            # Уведомляем пользователя
-            bot.send_message(uid, f"✅ Ваш файл <b>{filename}</b> был проверен администратором и разрешен к загрузке на хостинг!", parse_mode="HTML")
+
+    approved_file = approve_quarantine_file(qid)
+    if approved_file:
+        uid = approved_file["user_id"]
+        filename = approved_file["filename"]
+
+        bot.answer_callback_query(c.id, f"Файл {filename} разрешен")
+        bot.edit_message_reply_markup(c.message.chat.id, c.message.id, reply_markup=None)
+
+        bot.send_message(uid,
+                         f"✅ Ваш файл <b>{filename}</b> был проверен администратором и разрешен к загрузке на хостинг!",
+                         parse_mode="HTML")
     else:
         bot.answer_callback_query(c.id, "❌ Ошибка при разрешении файла", show_alert=True)
 
@@ -1598,11 +1793,12 @@ def main_menu_kb(uid: int):
         types.InlineKeyboardButton("📁 Мои файлы", callback_data="myfiles")
     )
     kb.add(
-        types.InlineKeyboardButton("⚡ Проверить скорость", callback_data="speed"),
-        types.InlineKeyboardButton("💎 Купить подписку", callback_data="buy")
+        types.InlineKeyboardButton("🗂 Проводник", callback_data="explorer:"),
+        types.InlineKeyboardButton("⚡ Проверить скорость", callback_data="speed")
     )
     kb.add(
-        types.InlineKeyboardButton("🎫 Ввести промокод", callback_data="promo")
+        types.InlineKeyboardButton("🎫 Ввести промокод", callback_data="promo"),
+        types.InlineKeyboardButton("💎 Купить подписку", callback_data="buy")
     )
     if uid == OWNER_ID:
         kb.add(types.InlineKeyboardButton("👑 Админ-панель", callback_data="admin"))
@@ -1670,7 +1866,8 @@ def back_to_main(c):
             f"📋 План: {subscription_info}\n"
             f"📁 Лимит файлов: {lim}\n"
             f"💾 RAM на файл: {ram_mb} MB | Суммарно: {total_ram_mb} MB\n"
-            f"⚙️ CPU на файл: {cpu_percent}% | Суммарно: {total_cpu_percent}%")
+            f"⚙️ CPU на файл: {cpu_percent}% | Суммарно: {total_cpu_percent}%\n"
+            f"📝 Поддерживаемые языки: Python 🐍, JavaScript 📜")
     
     safe_edit_text(bot.edit_message_text, text, c.message.chat.id, c.message.id, 
                    reply_markup=main_menu_kb(uid), parse_mode="HTML")
